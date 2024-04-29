@@ -1,0 +1,18 @@
+[package]
+name = "ordq"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Zhang Yanpo <drdr.xp@gmail.com>",
+]
+
+categories = ["algorithms", "data-structures"]
+description = "Order keeping job processing queue"
+documentation = "https://docs.rs/ord"
+homepage = "https://github.com/drmingdrmer"
+keywords = ["queue", "threadpool"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/drmingdrmer/ordq"
+
+[dependencies]
+crossbeam-channel = "0.5.12"
