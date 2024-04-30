@@ -25,16 +25,16 @@
 //!
 //! tx.close();
 //!
-//! assert_eq!(rx.recv(), Some(3));
-//! assert_eq!(rx.recv(), Some(7));
-//! assert_eq!(rx.recv(), Some(11));
+//! assert_eq!(rx.recv(), Some(Ok(3)));
+//! assert_eq!(rx.recv(), Some(Ok(7)));
+//! assert_eq!(rx.recv(), Some(Ok(11)));
 //! assert_eq!(rx.recv(), None);
 //! assert_eq!(rx.recv(), None);
 //! # }
 //! ```
 
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -59,21 +59,35 @@ struct Job<W: Work> {
 /// A `Worker` exhausts jobs from the input channel and sends the output to the output channel.
 struct Worker<W: Work> {
     input: crossbeam_channel::Receiver<Job<W>>,
+
     work: W,
 
     /// Stat
-    processed: Arc<AtomicUsize>,
+    stats: Arc<Stats>,
 }
 
 impl<W: Work> Worker<W> {
     fn worker_loop(mut self) {
         while let Ok(job) = self.input.recv() {
-            let res = self.work.run(job.input);
-            let _ = job.tx.send(res);
-            self.processed.fetch_add(1, Ordering::Relaxed);
+            let output = self.work.run(job.input);
+            if self.stats.inject_send_failure.load(Ordering::Relaxed) {
+                continue;
+            }
+            let _ = job.tx.send(output);
+            self.stats.processed.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
+
+/// Error when a sender failed to send the input because of receiving end is dropped
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("failed to send, receiver dropped")]
+pub struct SendError<I>(pub I);
+
+/// Error when a worker failed to send the output.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("failed to receive from a worker")]
+pub struct RecvError;
 
 /// The input sender that sends job input to the workers.
 #[derive(Clone)]
@@ -84,14 +98,17 @@ pub struct Sender<W: Work> {
 
 impl<W: Work> Sender<W> {
     /// Push a job into the queue.
-    pub fn send(&self, input: W::I) {
+    pub fn send(&self, input: W::I) -> Result<(), SendError<W::I>> {
         let (tx, rx) = mpsc::channel();
 
         // Push to output to keep order.
-        self.output_tx.send(rx).unwrap();
+        if let Err(_e) = self.output_tx.send(rx) {
+            return Err(SendError(input));
+        }
 
         let job = Job { input, tx };
-        self.input_tx.send(job).unwrap();
+        let _ = self.input_tx.send(job);
+        Ok(())
     }
 
     pub fn close(self) {}
@@ -100,27 +117,35 @@ impl<W: Work> Sender<W> {
 /// A coordinator runs jobs in a thread pool.
 pub struct Receiver<W: Work> {
     output_rx: mpsc::Receiver<mpsc::Receiver<W::O>>,
-    worker_handles: Vec<(Arc<AtomicUsize>, JoinHandle<()>)>,
+    worker_handles: Vec<(Arc<Stats>, JoinHandle<()>)>,
 }
 
 impl<W: Work> Receiver<W> {
     /// Receive an output.
     ///
-    /// If all workers are dropped, return None.
-    pub fn recv(&self) -> Option<W::O> {
+    /// If the sending end is dropped and no more pending job to run, return `None`.
+    ///
+    /// If a worker fails to send the output, return `Some(RecvError)`.
+    /// In this case, the caller can still receive the output from other workers.
+    pub fn recv(&self) -> Option<Result<W::O, RecvError>> {
         // No more output if all workers are dropped.
         let rx = self.output_rx.recv().ok()?;
-        let got = rx.recv().ok()?;
-        Some(got)
+        Some(rx.recv().map_err(|_e| RecvError))
     }
 
     /// Returns the number of jobs processed by each worker.
     pub fn stats(&self) -> Vec<usize> {
         self.worker_handles
             .iter()
-            .map(|(a, _)| a.load(Ordering::Relaxed))
+            .map(|(a, _)| a.processed.load(Ordering::Relaxed))
             .collect()
     }
+}
+
+#[derive(Default)]
+pub struct Stats {
+    pub processed: AtomicUsize,
+    pub inject_send_failure: AtomicBool,
 }
 
 /// Create a worker thread pool with the given queue capacity and workers.
@@ -134,12 +159,12 @@ pub fn new<W: Work>(
     let mut handles = Vec::new();
 
     for work in workers.into_iter() {
-        let stat = Arc::new(AtomicUsize::new(0));
+        let stat = Arc::new(Stats::default());
 
         let worker = Worker {
             input: input_rx.clone(),
             work,
-            processed: stat.clone(),
+            stats: stat.clone(),
         };
 
         let h = std::thread::spawn(move || {
@@ -183,39 +208,92 @@ mod tests {
     }
 
     #[test]
-    fn test_jobq() {
+    fn test_ordq() {
         let (tx, rx) = new(1024, vec![Add { i: 3 }, Add { i: 0 }, Add { i: 0 }]);
 
-        tx.send((1, 2));
-        tx.send((3, 4));
-        tx.send((5, 6));
+        tx.send((1, 2)).unwrap();
+        tx.send((3, 4)).unwrap();
+        tx.send((5, 6)).unwrap();
 
         tx.close();
 
-        assert_eq!(rx.recv(), Some(3));
-        assert_eq!(rx.recv(), Some(7));
-        assert_eq!(rx.recv(), Some(11));
+        assert_eq!(rx.recv(), Some(Ok(3)));
+        assert_eq!(rx.recv(), Some(Ok(7)));
+        assert_eq!(rx.recv(), Some(Ok(11)));
         assert_eq!(rx.recv(), None);
         assert_eq!(rx.recv(), None);
     }
 
     #[test]
-    fn test_jobq_order_is_kept() {
+    fn test_ordq_order_is_kept() {
         let (tx, rx) = new(1024, vec![Add { i: 3 }, Add { i: 2 }, Add { i: 0 }]);
 
         let n = 1_000_000;
 
         let _h = std::thread::spawn(move || {
             for i in 0..n {
-                tx.send((0, i));
+                tx.send((0, i)).unwrap();
             }
         });
 
         for i in 0..n {
-            assert_eq!(rx.recv(), Some(i));
+            assert_eq!(rx.recv(), Some(Ok(i)));
         }
 
         assert_eq!(rx.recv(), None);
         println!("{:?}", rx.stats());
+    }
+
+    #[test]
+    fn test_ordq_receiver_drooped() {
+        let (tx, rx) = new(1024, vec![Add { i: 3 }, Add { i: 0 }, Add { i: 0 }]);
+
+        tx.send((0, 2)).unwrap();
+        tx.send((0, 4)).unwrap();
+
+        assert_eq!(rx.recv(), Some(Ok(2)));
+        assert_eq!(rx.recv(), Some(Ok(4)));
+
+        drop(rx);
+        assert!(tx.send((0, 6)).is_err());
+    }
+
+    struct Foo;
+
+    impl Work for Foo {
+        type I = i32;
+        type O = i32;
+
+        fn run(&mut self, x: Self::I) -> Self::O {
+            x
+        }
+    }
+
+    #[test]
+    fn test_ordq_worker_not_send() {
+        let (tx, rx) = new(1024, vec![Foo, Foo]);
+
+        tx.send(2).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Inject send failure, not output will be sent.
+        for h in rx.worker_handles.iter() {
+            h.0.inject_send_failure.store(true, Ordering::Relaxed);
+        }
+
+        tx.send(3).unwrap();
+
+        assert_eq!(rx.recv(), Some(Ok(2)));
+        assert_eq!(rx.recv(), Some(Err(RecvError)));
+
+        // Reset the failure, the output will be sent.
+
+        for h in rx.worker_handles.iter() {
+            h.0.inject_send_failure.store(false, Ordering::Relaxed);
+        }
+
+        tx.send(4).unwrap();
+        assert_eq!(rx.recv(), Some(Ok(4)));
     }
 }

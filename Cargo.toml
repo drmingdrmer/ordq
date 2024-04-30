@@ -16,3 +16,4 @@ repository = "https://github.com/drmingdrmer/ordq"
 
 [dependencies]
 crossbeam-channel = "0.5.12"
+thiserror = "1.0.59"
