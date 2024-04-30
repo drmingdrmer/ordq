@@ -62,7 +62,7 @@ struct Worker<W: Work> {
 
     work: W,
 
-    /// Stat
+    /// Worker stat
     stats: Arc<Stats>,
 }
 
@@ -114,7 +114,7 @@ impl<W: Work> Sender<W> {
     pub fn close(self) {}
 }
 
-/// A coordinator runs jobs in a thread pool.
+/// Receives job output from the thread pool.
 pub struct Receiver<W: Work> {
     output_rx: mpsc::Receiver<mpsc::Receiver<W::O>>,
     worker_handles: Vec<(Arc<Stats>, JoinHandle<()>)>,
@@ -142,10 +142,14 @@ impl<W: Work> Receiver<W> {
     }
 }
 
+/// Worker stats
 #[derive(Default)]
 pub struct Stats {
+    /// Number of job processed by this worker.
     pub processed: AtomicUsize,
-    pub inject_send_failure: AtomicBool,
+
+    /// Inject send failure for testing.
+    inject_send_failure: AtomicBool,
 }
 
 /// Create a worker thread pool with the given queue capacity and workers.
